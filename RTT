@@ -1,0 +1,217 @@
+import sqlite3
+import pandas as pd
+import csv
+import os
+
+# Database file
+DB_FILE = 'student_performance.db'
+
+def init_db():
+    """Initialize the database with required tables if they don't exist"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # Create students table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS students (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        gender TEXT,
+        age INTEGER
+    )
+    ''')
+    
+    # Create scores table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS scores (
+        id INTEGER PRIMARY KEY,
+        student_id INTEGER,
+        subject TEXT NOT NULL,
+        score REAL NOT NULL,
+        FOREIGN KEY (student_id) REFERENCES students (id)
+    )
+    ''')
+    
+    # Create analysis_results table to store cached analysis
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS analysis_results (
+        id INTEGER PRIMARY KEY,
+        analysis_type TEXT NOT NULL,
+        subject TEXT,
+        result TEXT NOT NULL,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+def import_csv_to_db(csv_file_path):
+    """Import student data from CSV to database"""
+    if not os.path.exists(csv_file_path):
+        print(f"CSV file not found: {csv_file_path}")
+        return False
+    
+    # Read CSV file
+    with open(csv_file_path, 'r') as f:
+        reader = csv.reader(f)
+        headers = next(reader)  # Get headers
+        
+        # Extract basic student columns and subject columns
+        student_cols = ['StudentID', 'Name', 'Gender', 'Age']
+        subject_cols = [col for col in headers if col not in student_cols]
+        
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        # Insert data
+        for row in reader:
+            # Extract student data
+            student_id = int(row[headers.index('StudentID')])
+            name = row[headers.index('Name')]
+            gender = row[headers.index('Gender')] if 'Gender' in headers else None
+            age = int(row[headers.index('Age')]) if 'Age' in headers else None
+            
+            # Insert or update student
+            cursor.execute('''
+            INSERT OR REPLACE INTO students (id, name, gender, age)
+            VALUES (?, ?, ?, ?)
+            ''', (student_id, name, gender, age))
+            
+            # Insert or update scores for each subject
+            for subject in subject_cols:
+                score = float(row[headers.index(subject)])
+                
+                cursor.execute('''
+                INSERT OR REPLACE INTO scores (student_id, subject, score)
+                SELECT ?, ?, ?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM scores 
+                    WHERE student_id = ? AND subject = ?
+                )
+                ''', (student_id, subject, score, student_id, subject))
+        
+        conn.commit()
+        conn.close()
+        return True
+
+def get_all_students():
+    """Retrieve all students from the database"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    SELECT id, name, gender, age FROM students
+    ''')
+    
+    students = cursor.fetchall()
+    conn.close()
+    
+    return [{'id': s[0], 'name': s[1], 'gender': s[2], 'age': s[3]} for s in students]
+
+def get_all_scores():
+    """Retrieve all scores from the database"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    SELECT student_id, subject, score FROM scores
+    ''')
+    
+    scores = cursor.fetchall()
+    conn.close()
+    
+    return [{'student_id': s[0], 'subject': s[1], 'score': s[2]} for s in scores]
+
+def get_student_data_as_df():
+    """Get student data with scores in a format similar to the CSV"""
+    conn = sqlite3.connect(DB_FILE)
+    
+    # Get students
+    students_df = pd.read_sql('''
+    SELECT id as StudentID, name as Name, gender as Gender, age as Age
+    FROM students
+    ''', conn)
+    
+    if len(students_df) == 0:
+        conn.close()
+        return None
+    
+    # Get scores
+    scores_df = pd.read_sql('''
+    SELECT student_id, subject, score
+    FROM scores
+    ''', conn)
+    
+    conn.close()
+    
+    if len(scores_df) == 0:
+        return students_df
+    
+    # Pivot scores to get one column per subject
+    pivot_df = scores_df.pivot(index='student_id', columns='subject', values='score')
+    pivot_df.reset_index(inplace=True)
+    pivot_df.rename(columns={'student_id': 'StudentID'}, inplace=True)
+    
+    # Merge with students data
+    result_df = pd.merge(students_df, pivot_df, on='StudentID')
+    
+    return result_df
+
+def save_analysis_result(analysis_type, result_dict, subject=None):
+    """Save analysis result to database"""
+    import json
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # Convert dict to JSON
+    result_json = json.dumps(result_dict)
+    
+    cursor.execute('''
+    INSERT INTO analysis_results (analysis_type, subject, result)
+    VALUES (?, ?, ?)
+    ''', (analysis_type, subject, result_json))
+    
+    conn.commit()
+    conn.close()
+
+def get_analysis_results(analysis_type=None, subject=None):
+    """Retrieve analysis results from database"""
+    import json
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    query = "SELECT analysis_type, subject, result, timestamp FROM analysis_results"
+    params = []
+    
+    if analysis_type or subject:
+        query += " WHERE"
+        
+        if analysis_type:
+            query += " analysis_type = ?"
+            params.append(analysis_type)
+            
+            if subject:
+                query += " AND"
+                
+        if subject:
+            query += " subject = ?"
+            params.append(subject)
+    
+    cursor.execute(query, params)
+    results = cursor.fetchall()
+    conn.close()
+    
+    # Parse JSON
+    parsed_results = []
+    for r in results:
+        parsed_results.append({
+            'analysis_type': r[0],
+            'subject': r[1],
+            'result': json.loads(r[2]),
+            'timestamp': r[3]
+        })
+    
+    return parsed_results
