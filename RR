@@ -1,0 +1,347 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+import sqlite3
+import os
+from database import init_db, import_csv_to_db, get_student_data_as_df
+
+# Initialize the database
+init_db()
+
+# Page configuration
+st.set_page_config(
+    page_title="Student Performance Analysis",
+    page_icon="📊",
+    layout="wide"
+)
+
+# Function to load data
+@st.cache_data
+def load_data():
+    # Check if database has data, otherwise import from CSV
+    df = get_student_data_as_df()
+    if df is None or len(df) == 0:
+        if os.path.exists('sample_data.csv'):
+            import_csv_to_db('sample_data.csv')
+            df = get_student_data_as_df()
+        else:
+            st.error("No data found in database and sample_data.csv is missing")
+            return None
+    return df
+
+# Function to analyze student data
+def analyze_student_data(df):
+    if df is None:
+        return None
+        
+    # Get numeric columns (subjects)
+    subject_cols = df.select_dtypes(include=['float64', 'int64']).columns
+    subject_cols = [col for col in subject_cols if col not in ['StudentID', 'Age']]
+    
+    # Calculate basic statistics
+    stats = {}
+    for subject in subject_cols:
+        stats[subject] = {
+            'Mean': df[subject].mean(),
+            'Median': df[subject].median(),
+            'Std Dev': df[subject].std(),
+            'Min': df[subject].min(),
+            'Max': df[subject].max()
+        }
+    
+    # Pass rates (assuming 60 is passing mark)
+    pass_rates = {}
+    distinction_rates = {}
+    for subject in subject_cols:
+        pass_rates[subject] = (df[subject] >= 60).mean() * 100
+        distinction_rates[subject] = (df[subject] >= 85).mean() * 100
+    
+    # Calculate correlations
+    correlations = df[subject_cols].corr()
+    
+    return {
+        'subjects': subject_cols,
+        'statistics': stats,
+        'pass_rates': pass_rates,
+        'distinction_rates': distinction_rates,
+        'correlations': correlations
+    }
+
+# Main app
+def main():
+    st.title("📊 Student Performance Analysis")
+    
+    # Sidebar
+    st.sidebar.title("Navigation")
+    page = st.sidebar.radio("Select a page:", ["Dashboard", "Student Analysis", "Subject Analysis", "Correlations"])
+    
+    # Load data
+    df = load_data()
+    
+    if df is not None:
+        # Get analysis results
+        analysis_results = analyze_student_data(df)
+        
+        if page == "Dashboard":
+            display_dashboard(df, analysis_results)
+        elif page == "Student Analysis":
+            display_student_analysis(df, analysis_results)
+        elif page == "Subject Analysis":
+            display_subject_analysis(df, analysis_results)
+        elif page == "Correlations":
+            display_correlations(df, analysis_results)
+    else:
+        st.error("Failed to load data. Please check if the database is properly initialized.")
+
+# Dashboard page
+def display_dashboard(df, analysis):
+    st.header("Performance Dashboard")
+    
+    # Display summary statistics
+    st.subheader("Subject Performance Overview")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Display pass rates
+        pass_data = {
+            'Subject': list(analysis['pass_rates'].keys()),
+            'Pass Rate (%)': list(analysis['pass_rates'].values()),
+            'Distinction Rate (%)': list(analysis['distinction_rates'].values())
+        }
+        pass_df = pd.DataFrame(pass_data)
+        
+        fig = px.bar(pass_df, x='Subject', y=['Pass Rate (%)', 'Distinction Rate (%)'],
+                    title="Pass and Distinction Rates by Subject",
+                    barmode='group')
+        st.plotly_chart(fig, use_container_width=True)
+    
+    with col2:
+        # Display mean scores
+        mean_data = {
+            'Subject': list(analysis['statistics'].keys()),
+            'Mean Score': [stats['Mean'] for stats in analysis['statistics'].values()]
+        }
+        mean_df = pd.DataFrame(mean_data)
+        
+        fig = px.bar(mean_df, x='Subject', y='Mean Score',
+                    title="Average Score by Subject",
+                    color='Mean Score',
+                    color_continuous_scale=px.colors.sequential.Viridis)
+        fig.update_layout(coloraxis_showscale=False)
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # Display distribution of scores across subjects
+    st.subheader("Score Distribution Across Subjects")
+    
+    fig = px.box(df, y=analysis['subjects'],
+                title="Score Distribution by Subject",
+                labels={'value': 'Score', 'variable': 'Subject'})
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Display student count
+    st.metric("Total Students", len(df))
+
+# Student Analysis page
+def display_student_analysis(df, analysis):
+    st.header("Student Analysis")
+    
+    # Student selector
+    students = df['Name'].tolist()
+    selected_student = st.selectbox("Select a student:", students)
+    
+    # Get student data
+    student_data = df[df['Name'] == selected_student]
+    
+    # Display student info
+    st.subheader(f"Performance of {selected_student}")
+    
+    # Student's scores
+    st.markdown("### Scores by Subject")
+    
+    # Create score data
+    score_data = {
+        'Subject': analysis['subjects'],
+        'Score': [student_data[subject].values[0] for subject in analysis['subjects']],
+        'Class Average': [analysis['statistics'][subject]['Mean'] for subject in analysis['subjects']]
+    }
+    score_df = pd.DataFrame(score_data)
+    
+    # Plot student vs average
+    fig = px.bar(score_df, x='Subject', y=['Score', 'Class Average'],
+                title=f"{selected_student}'s Performance vs. Class Average",
+                barmode='group')
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Calculate overall performance
+    overall_score = score_df['Score'].mean()
+    overall_avg = score_df['Class Average'].mean()
+    
+    # Performance metrics
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric("Overall Average", f"{overall_score:.1f}")
+    
+    with col2:
+        st.metric("Class Average", f"{overall_avg:.1f}", 
+                  delta=f"{overall_score - overall_avg:.1f}")
+    
+    with col3:
+        # Count subjects where student outperformed average
+        outperform_count = sum(score_df['Score'] > score_df['Class Average'])
+        st.metric("Subjects Above Average", f"{outperform_count}/{len(analysis['subjects'])}")
+    
+    # Student's rank in each subject
+    st.markdown("### Rank by Subject")
+    
+    ranks = {}
+    for subject in analysis['subjects']:
+        # Sort students by subject score
+        sorted_df = df.sort_values(by=subject, ascending=False)
+        # Find the rank of the selected student
+        rank = sorted_df[sorted_df['Name'] == selected_student].index.tolist()[0] + 1
+        ranks[subject] = rank
+    
+    # Create rank dataframe
+    rank_data = {
+        'Subject': list(ranks.keys()),
+        'Rank': list(ranks.values()),
+        'Total Students': len(df)
+    }
+    rank_df = pd.DataFrame(rank_data)
+    
+    # Display rank table
+    st.table(rank_df)
+
+# Subject Analysis page
+def display_subject_analysis(df, analysis):
+    st.header("Subject Analysis")
+    
+    # Subject selector
+    selected_subject = st.selectbox("Select a subject:", analysis['subjects'])
+    
+    # Display subject statistics
+    st.subheader(f"{selected_subject} Performance Analysis")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Display basic statistics
+        stats = analysis['statistics'][selected_subject]
+        st.markdown("### Basic Statistics")
+        
+        stats_df = pd.DataFrame({
+            'Metric': stats.keys(),
+            'Value': [f"{v:.2f}" for v in stats.values()]
+        })
+        st.table(stats_df)
+        
+        # Pass and distinction rates
+        st.markdown("### Pass & Distinction Rates")
+        st.metric("Pass Rate", f"{analysis['pass_rates'][selected_subject]:.1f}%")
+        st.metric("Distinction Rate", f"{analysis['distinction_rates'][selected_subject]:.1f}%")
+    
+    with col2:
+        # Score distribution histogram
+        st.markdown("### Score Distribution")
+        
+        fig = px.histogram(df, x=selected_subject, nbins=10,
+                          title=f"Distribution of {selected_subject} Scores",
+                          labels={selected_subject: 'Score', 'count': 'Number of Students'})
+        fig.update_layout(bargap=0.1)
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # Top and bottom performers
+    st.subheader("Top & Bottom Performers")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("### Top 5 Students")
+        top_students = df.sort_values(by=selected_subject, ascending=False).head(5)
+        top_data = pd.DataFrame({
+            'Name': top_students['Name'],
+            'Score': top_students[selected_subject]
+        }).reset_index(drop=True)
+        top_data.index = top_data.index + 1  # Start index from 1
+        st.table(top_data)
+    
+    with col2:
+        st.markdown("### Bottom 5 Students")
+        bottom_students = df.sort_values(by=selected_subject, ascending=True).head(5)
+        bottom_data = pd.DataFrame({
+            'Name': bottom_students['Name'],
+            'Score': bottom_students[selected_subject]
+        }).reset_index(drop=True)
+        bottom_data.index = bottom_data.index + 1  # Start index from 1
+        st.table(bottom_data)
+
+# Correlations page
+def display_correlations(df, analysis):
+    st.header("Subject Correlations")
+    
+    st.markdown("""
+    This page shows the correlations between different subjects. A high positive correlation 
+    suggests that students who perform well in one subject tend to perform well in the other.
+    """)
+    
+    # Display correlation matrix
+    st.subheader("Correlation Matrix")
+    
+    corr_matrix = analysis['correlations']
+    
+    # Create heatmap
+    fig = px.imshow(corr_matrix,
+                   labels=dict(x="Subject", y="Subject", color="Correlation"),
+                   x=corr_matrix.columns,
+                   y=corr_matrix.columns,
+                   color_continuous_scale='RdBu_r',
+                   range_color=[-1, 1])
+                   
+    fig.update_layout(width=700, height=700)
+    st.plotly_chart(fig)
+    
+    # Subject pair correlation explorer
+    st.subheader("Subject Pair Correlation Explorer")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        subject1 = st.selectbox("Select first subject:", analysis['subjects'], key="subj1")
+    
+    with col2:
+        subject2 = st.selectbox("Select second subject:", analysis['subjects'], key="subj2", 
+                               index=1 if len(analysis['subjects']) > 1 else 0)
+    
+    if subject1 != subject2:
+        # Calculate correlation
+        correlation = corr_matrix.loc[subject1, subject2]
+        
+        # Correlation strength interpretation
+        if abs(correlation) < 0.3:
+            strength = "weak"
+        elif abs(correlation) < 0.7:
+            strength = "moderate"
+        else:
+            strength = "strong"
+        
+        direction = "positive" if correlation > 0 else "negative"
+        
+        st.info(f"The correlation between {subject1} and {subject2} is {correlation:.2f}, "
+                f"indicating a {strength} {direction} relationship.")
+        
+        # Scatter plot
+        fig = px.scatter(df, x=subject1, y=subject2, 
+                        trendline="ols",
+                        title=f"Correlation between {subject1} and {subject2}",
+                        labels={subject1: f"{subject1} Score", subject2: f"{subject2} Score"})
+        
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning("Please select two different subjects to see their correlation.")
+
+if __name__ == "__main__":
+    main()
